@@ -4,12 +4,13 @@
 #include <MS5837.h>
 #include <ESP32Servo.h>
 #include <Adafruit_NeoPixel.h>
+#include <math.h>
 
 // ===== Team / mission info =====
 const char* TEAM_ID = "EX01";
 
 // ===== Mission options =====
-const bool SELF_RECOVER_TO_SURFACE = false;   // false = stay at 0.40 m, true = surface after final hold
+const bool SELF_RECOVER_TO_SURFACE = true;   // false = stay at 0.40 m, true = surface after final hold
 
 // ===== WiFi AP config =====
 const char* ssid = "VP_Float";
@@ -39,7 +40,7 @@ const int ACTUATOR_PIN = 8;
 const int ACTUATOR_MIN_US = 1000;
 const int ACTUATOR_MAX_US = 2000;
 const int ACTUATOR_NEUTRAL_US = 1500;
-const int ACTUATOR_IDLE_US = 1000;
+const int ACTUATOR_IDLE_US = 2000;   // intentional
 
 // Startup priming
 const int PRIME_HIGH_US = 2000;
@@ -55,10 +56,9 @@ const int CONTROL_DIRECTION = -1;
 int actuatorCommandUs = -1;
 
 // ===== PID tuning =====
-// Output is in microseconds
-float PID_KP = 220.0f;
-float PID_KI = 4.0f;
-float PID_KD = 90.0f;
+float PID_KP = 700.0f;
+float PID_KI = 0.0f;
+float PID_KD = 0.0f;
 
 // Integral clamp to prevent windup
 float PID_INTEGRAL_MIN = -1.5f;
@@ -68,11 +68,11 @@ float PID_INTEGRAL_MAX =  1.5f;
 const unsigned long PID_INTERVAL_MS = 100;
 
 // ===== Mission targets =====
-const float TARGET_DEEP_M = 2.50f;
+const float TARGET_DEEP_M = 0.60f;
 const float TARGET_SHALLOW_M = 0.40f;
-const float TARGET_SURFACE_M = 0.02f;         // near-surface recovery target
+const float TARGET_SURFACE_M = 0.02f;
 const unsigned long HOLD_TIME_MS = 30000;
-const float TARGET_TOLERANCE_M = 0.05f;       // enter hold when within ±5 cm
+const float TARGET_TOLERANCE_M = 0.05f;     // ±5 cm
 const float SURFACE_TOLERANCE_M = 0.05f;
 
 // ===== Zeroing =====
@@ -115,6 +115,8 @@ const unsigned long SAMPLE_INTERVAL_MS = 200;
 
 // ===== Hold timing =====
 unsigned long stateEntryMillis = 0;
+unsigned long inToleranceStartMillis = 0;
+bool inToleranceTimerRunning = false;
 
 // ===== PID state =====
 float pidIntegral = 0.0f;
@@ -146,6 +148,9 @@ void resetPID();
 void runDepthPID(float targetDepthM);
 void zeroDepthSensor();
 void logSampleIfNeeded();
+
+bool isWithinTolerance(float targetDepthM, float toleranceM);
+bool holdCompleteAtTarget(float targetDepthM, float toleranceM, unsigned long holdTimeMs);
 
 void sendHeader(WiFiClient& client, const char* contentType);
 void sendOK(WiFiClient& client, const char* msg);
@@ -235,6 +240,8 @@ void loop() {
 void enterState(State newState) {
   currentState = newState;
   stateEntryMillis = millis();
+  inToleranceStartMillis = 0;
+  inToleranceTimerRunning = false;
   resetPID();
   updateStateLEDs();
 
@@ -423,6 +430,29 @@ void logSampleIfNeeded() {
   }
 }
 
+// ===== Hold helpers =====
+bool isWithinTolerance(float targetDepthM, float toleranceM) {
+  return fabs(liveDepth_m - targetDepthM) <= toleranceM;
+}
+
+bool holdCompleteAtTarget(float targetDepthM, float toleranceM, unsigned long holdTimeMs) {
+  if (isWithinTolerance(targetDepthM, toleranceM)) {
+    if (!inToleranceTimerRunning) {
+      inToleranceTimerRunning = true;
+      inToleranceStartMillis = millis();
+    }
+
+    if (millis() - inToleranceStartMillis >= holdTimeMs) {
+      return true;
+    }
+  } else {
+    inToleranceTimerRunning = false;
+    inToleranceStartMillis = 0;
+  }
+
+  return false;
+}
+
 // ===== Mission control =====
 void startMission() {
   sampleCount = 0;
@@ -455,56 +485,56 @@ void runStateMachine() {
 
     case DESCEND_1:
       runDepthPID(TARGET_DEEP_M);
-      if (liveDepth_m >= (TARGET_DEEP_M - TARGET_TOLERANCE_M)) {
+      if (isWithinTolerance(TARGET_DEEP_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_250_1);
       }
       break;
 
     case HOLD_250_1:
       runDepthPID(TARGET_DEEP_M);
-      if (millis() - stateEntryMillis >= HOLD_TIME_MS) {
+      if (holdCompleteAtTarget(TARGET_DEEP_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         enterState(ASCEND_1);
       }
       break;
 
     case ASCEND_1:
       runDepthPID(TARGET_SHALLOW_M);
-      if (liveDepth_m <= (TARGET_SHALLOW_M + TARGET_TOLERANCE_M)) {
+      if (isWithinTolerance(TARGET_SHALLOW_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_040_1);
       }
       break;
 
     case HOLD_040_1:
       runDepthPID(TARGET_SHALLOW_M);
-      if (millis() - stateEntryMillis >= HOLD_TIME_MS) {
+      if (holdCompleteAtTarget(TARGET_SHALLOW_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         enterState(DESCEND_2);
       }
       break;
 
     case DESCEND_2:
       runDepthPID(TARGET_DEEP_M);
-      if (liveDepth_m >= (TARGET_DEEP_M - TARGET_TOLERANCE_M)) {
+      if (isWithinTolerance(TARGET_DEEP_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_250_2);
       }
       break;
 
     case HOLD_250_2:
       runDepthPID(TARGET_DEEP_M);
-      if (millis() - stateEntryMillis >= HOLD_TIME_MS) {
+      if (holdCompleteAtTarget(TARGET_DEEP_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         enterState(ASCEND_2);
       }
       break;
 
     case ASCEND_2:
       runDepthPID(TARGET_SHALLOW_M);
-      if (liveDepth_m <= (TARGET_SHALLOW_M + TARGET_TOLERANCE_M)) {
+      if (isWithinTolerance(TARGET_SHALLOW_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_040_2);
       }
       break;
 
     case HOLD_040_2:
       runDepthPID(TARGET_SHALLOW_M);
-      if (millis() - stateEntryMillis >= HOLD_TIME_MS) {
+      if (holdCompleteAtTarget(TARGET_SHALLOW_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         if (SELF_RECOVER_TO_SURFACE) {
           enterState(RECOVER_SURFACE);
         } else {
@@ -519,7 +549,7 @@ void runStateMachine() {
 
     case RECOVER_SURFACE:
       runDepthPID(TARGET_SURFACE_M);
-      if (liveDepth_m <= (TARGET_SURFACE_M + SURFACE_TOLERANCE_M)) {
+      if (isWithinTolerance(TARGET_SURFACE_M, SURFACE_TOLERANCE_M)) {
         setActuatorUs(ACTUATOR_IDLE_US);
       }
       break;
@@ -815,7 +845,7 @@ function drawGraph(times, depths) {
     return;
   }
 
-  const left = 60;
+  const left = 70;
   const right = canvas.width - 20;
   const top = 20;
   const bottom = canvas.height - 50;
@@ -837,10 +867,19 @@ function drawGraph(times, depths) {
     dMin -= 0.1;
   }
 
+  // Add padding to depth range
   const pad = (dMax - dMin) * 0.1;
   dMax += pad;
   dMin -= pad;
 
+  // Prevent weird values
+  if (dMin < 0) dMin = 0;
+
+  // Background
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Axes
   ctx.strokeStyle = '#000';
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -849,17 +888,73 @@ function drawGraph(times, depths) {
   ctx.lineTo(right, bottom);
   ctx.stroke();
 
+  // ----- Grid and Y ticks -----
+  const yTicks = 6;
+  ctx.font = '12px Helvetica';
+  ctx.fillStyle = '#000';
+  ctx.strokeStyle = '#ccc';
+  ctx.lineWidth = 1;
+
+  for (let i = 0; i <= yTicks; i++) {
+    const frac = i / yTicks;
+    const y = top + frac * height;
+
+    // Because deeper should be lower on screen:
+    const depthValue = dMin + frac * (dMax - dMin);
+
+    // horizontal grid line
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(right, y);
+    ctx.stroke();
+
+    // tick mark
+    ctx.strokeStyle = '#000';
+    ctx.beginPath();
+    ctx.moveTo(left - 6, y);
+    ctx.lineTo(left, y);
+    ctx.stroke();
+
+    // label
+    ctx.fillText(depthValue.toFixed(2), 10, y + 4);
+
+    ctx.strokeStyle = '#ccc';
+  }
+
+  // ----- Grid and X ticks -----
+  const xTicks = 6;
+  for (let i = 0; i <= xTicks; i++) {
+    const frac = i / xTicks;
+    const x = left + frac * width;
+    const timeValue = tMin + frac * (tMax - tMin);
+
+    // vertical grid line
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, bottom);
+    ctx.stroke();
+
+    // tick mark
+    ctx.strokeStyle = '#000';
+    ctx.beginPath();
+    ctx.moveTo(x, bottom);
+    ctx.lineTo(x, bottom + 6);
+    ctx.stroke();
+
+    // label
+    ctx.fillStyle = '#000';
+    ctx.fillText(timeValue.toFixed(1), x - 10, bottom + 20);
+
+    ctx.strokeStyle = '#ccc';
+  }
+
+  // Axis labels
   ctx.fillStyle = '#000';
   ctx.font = '14px Helvetica';
   ctx.fillText('Depth (m)', 10, 15);
-  ctx.fillText('Time (s)', right - 60, canvas.height - 10);
+  ctx.fillText('Time (s)', right - 55, canvas.height - 10);
 
-  ctx.fillText(dMax.toFixed(3), 5, top + 5);
-  ctx.fillText(dMin.toFixed(3), 5, bottom);
-
-  ctx.fillText(tMin.toFixed(1), left - 5, bottom + 20);
-  ctx.fillText(tMax.toFixed(1), right - 20, bottom + 20);
-
+  // ----- Plot -----
   ctx.strokeStyle = '#0077cc';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -869,11 +964,15 @@ function drawGraph(times, depths) {
     const d = depths[i];
 
     const x = left + ((t - tMin) / (tMax - tMin)) * width;
-    const y = bottom - ((d - dMin) / (dMax - dMin)) * height;
+
+    // IMPORTANT:
+    // shallow depth near top, deeper depth near bottom
+    const y = top + ((d - dMin) / (dMax - dMin)) * height;
 
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
+
   ctx.stroke();
 }
 
