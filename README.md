@@ -269,13 +269,6 @@ These LEDs show how the VP is moving in the water.
 
 The display is scaled to about **0.2 m/s** maximum expected velocity.
 
-This means:
-
-- a faint color indicates slow movement
-- a strong color indicates faster movement
-- yellow tells you the profiler is rising
-- purple tells you the profiler is descending
-
 ### LED 3: State Indicator
 
 This LED shows the current operating state of the VP.
