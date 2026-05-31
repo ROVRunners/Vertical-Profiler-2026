@@ -40,7 +40,7 @@ const int ACTUATOR_PIN = 8;
 const int ACTUATOR_MIN_US = 500;
 const int ACTUATOR_MAX_US = 2500;
 const int ACTUATOR_NEUTRAL_US = 1500;
-const int ACTUATOR_IDLE_US = 500;   // intentional
+const int ACTUATOR_IDLE_US = 500;
 
 // Startup priming
 const int PRIME_HIGH_US = 2000;
@@ -72,12 +72,15 @@ float PID_INTEGRAL_MAX =  1.5f;
 const unsigned long PID_INTERVAL_MS = 100;
 
 // ===== Mission targets =====
-const float TARGET_DEEP_M = 0.60f;
-const float TARGET_SHALLOW_M = 0.40f;
-const float TARGET_SURFACE_M = 0.02f;
-const unsigned long HOLD_TIME_MS = 30000;
-const float TARGET_TOLERANCE_M = 0.05f;     // ±5 cm
-const float SURFACE_TOLERANCE_M = 0.05f;
+float TARGET_DEEP_M = 0.60f;
+float TARGET_SHALLOW_M = 0.40f;
+float TARGET_SURFACE_M = 0.02f;
+unsigned long HOLD_TIME_MS = 30000;
+float TARGET_TOLERANCE_M = 0.05f;
+float SURFACE_TOLERANCE_M = 0.05f;
+unsigned long MAX_TRANSIT_TIME_MS = 90000;
+unsigned long MAX_HOLD_TIME_MS = 60000;
+unsigned long MAX_RECOVER_TIME_MS = 90000;
 
 // ===== Zeroing =====
 const int ZERO_SAMPLE_COUNT = 20;
@@ -156,11 +159,10 @@ void updateStateLEDs();
 void enterState(State newState);
 const char* stateName(State s);
 void primeBuoyancyEngine();
+bool stateTimedOut(unsigned long maxTimeMs);
 
 float clampFloat(float x, float lo, float hi);
-uint32_t blendColor(uint8_t r1, uint8_t g1, uint8_t b1,
-                    uint8_t r2, uint8_t g2, uint8_t b2,
-                    float t);
+uint32_t blendColor(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2, float t);
 bool stateHasTarget(State s);
 float getCurrentTargetDepth();
 float getCurrentTargetTolerance();
@@ -169,6 +171,9 @@ void sendManual(WiFiClient& client);
 void handleSetManualMode(WiFiClient& client, const String& request);
 void handleSetManualUs(WiFiClient& client, const String& request);
 int getQueryParamInt(const String& request, const String& key, int currentValue);
+void sendMission(WiFiClient& client);
+void handleSetMission(WiFiClient& client, const String& request);
+unsigned long getQueryParamULong(const String& request, const String& key, unsigned long currentValue);
 
 void resetPID();
 void runDepthPID(float targetDepthM);
@@ -685,6 +690,10 @@ void stopLoggingAndIdle() {
   Serial.println(sampleCount);
 }
 
+bool stateTimedOut(unsigned long maxTimeMs) {
+  return (millis() - stateEntryMillis) >= maxTimeMs;
+}
+
 // ===== State Machine =====
 void runStateMachine() {
   switch (currentState) {
@@ -694,56 +703,100 @@ void runStateMachine() {
 
     case DESCEND_1:
       runDepthPID(TARGET_DEEP_M);
+
       if (isWithinTolerance(TARGET_DEEP_M, TARGET_TOLERANCE_M)) {
+        enterState(HOLD_250_1);
+      }
+      else if (stateTimedOut(MAX_TRANSIT_TIME_MS)) {
+        Serial.println("DESCEND_1 timeout -> HOLD_250_1");
         enterState(HOLD_250_1);
       }
       break;
 
     case HOLD_250_1:
       runDepthPID(TARGET_DEEP_M);
+
       if (holdCompleteAtTarget(TARGET_DEEP_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
+        enterState(ASCEND_1);
+      }
+      else if (stateTimedOut(MAX_HOLD_TIME_MS)) {
+        Serial.println("HOLD_250_1 timeout -> ASCEND_1");
         enterState(ASCEND_1);
       }
       break;
 
     case ASCEND_1:
       runDepthPID(TARGET_SHALLOW_M);
+
       if (isWithinTolerance(TARGET_SHALLOW_M, TARGET_TOLERANCE_M)) {
+        enterState(HOLD_040_1);
+      }
+      else if (stateTimedOut(MAX_TRANSIT_TIME_MS)) {
+        Serial.println("ASCEND_1 timeout -> HOLD_040_1");
         enterState(HOLD_040_1);
       }
       break;
 
     case HOLD_040_1:
       runDepthPID(TARGET_SHALLOW_M);
+
       if (holdCompleteAtTarget(TARGET_SHALLOW_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
+        enterState(DESCEND_2);
+      }
+      else if (stateTimedOut(MAX_HOLD_TIME_MS)) {
+        Serial.println("HOLD_040_1 timeout -> DESCEND_2");
         enterState(DESCEND_2);
       }
       break;
 
     case DESCEND_2:
       runDepthPID(TARGET_DEEP_M);
+
       if (isWithinTolerance(TARGET_DEEP_M, TARGET_TOLERANCE_M)) {
+        enterState(HOLD_250_2);
+      }
+      else if (stateTimedOut(MAX_TRANSIT_TIME_MS)) {
+        Serial.println("DESCEND_2 timeout -> HOLD_250_2");
         enterState(HOLD_250_2);
       }
       break;
 
     case HOLD_250_2:
       runDepthPID(TARGET_DEEP_M);
+
       if (holdCompleteAtTarget(TARGET_DEEP_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
+        enterState(ASCEND_2);
+      }
+      else if (stateTimedOut(MAX_HOLD_TIME_MS)) {
+        Serial.println("HOLD_250_2 timeout -> ASCEND_2");
         enterState(ASCEND_2);
       }
       break;
 
     case ASCEND_2:
       runDepthPID(TARGET_SHALLOW_M);
+
       if (isWithinTolerance(TARGET_SHALLOW_M, TARGET_TOLERANCE_M)) {
+        enterState(HOLD_040_2);
+      }
+      else if (stateTimedOut(MAX_TRANSIT_TIME_MS)) {
+        Serial.println("ASCEND_2 timeout -> HOLD_040_2");
         enterState(HOLD_040_2);
       }
       break;
 
     case HOLD_040_2:
       runDepthPID(TARGET_SHALLOW_M);
+
       if (holdCompleteAtTarget(TARGET_SHALLOW_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
+        if (SELF_RECOVER_TO_SURFACE) {
+          enterState(RECOVER_SURFACE);
+        } else {
+          enterState(STATION_KEEP_040);
+        }
+      }
+      else if (stateTimedOut(MAX_HOLD_TIME_MS)) {
+        Serial.println("HOLD_040_2 timeout -> next state");
         if (SELF_RECOVER_TO_SURFACE) {
           enterState(RECOVER_SURFACE);
         } else {
@@ -758,11 +811,17 @@ void runStateMachine() {
 
     case RECOVER_SURFACE:
       runDepthPID(TARGET_SURFACE_M);
+
       if (isWithinTolerance(TARGET_SURFACE_M, SURFACE_TOLERANCE_M)) {
         setActuatorUs(ACTUATOR_IDLE_US);
       }
+      else if (stateTimedOut(MAX_RECOVER_TIME_MS)) {
+        Serial.println("RECOVER_SURFACE timeout -> IDLE");
+        setActuatorUs(ACTUATOR_IDLE_US);
+        enterState(IDLE);
+      }
       break;
-    
+
     case MANUAL:
       setActuatorUs(manualCommandUs);
       break;
@@ -818,6 +877,12 @@ void handleClient() {
   }
   else if (request.indexOf("GET /setmanualus") >= 0) {
     handleSetManualUs(client, request);
+  }
+  else if (request.indexOf("GET /mission") >= 0) {
+    sendMission(client);
+  }
+  else if (request.indexOf("GET /setmission") >= 0) {
+    handleSetMission(client, request);
   }
   else {
     sendPage(client);
@@ -970,6 +1035,23 @@ int getQueryParamInt(const String& request, const String& key, int currentValue)
   return valueStr.toInt();
 }
 
+unsigned long getQueryParamULong(const String& request, const String& key, unsigned long currentValue) {
+  String token = key + "=";
+  int start = request.indexOf(token);
+  if (start < 0) return currentValue;
+
+  start += token.length();
+  int end = request.indexOf('&', start);
+  if (end < 0) end = request.indexOf(' ', start);
+  if (end < 0) end = request.length();
+
+  String valueStr = request.substring(start, end);
+  valueStr.trim();
+
+  if (valueStr.length() == 0) return currentValue;
+  return (unsigned long)valueStr.toInt();
+}
+
 void sendPID(WiFiClient& client) {
   sendHeader(client, "application/json");
 
@@ -1000,6 +1082,92 @@ void handleSetPID(WiFiClient& client, const String& request) {
   Serial.println(PID_KD, 4);
 
   sendPID(client);
+}
+
+void sendMission(WiFiClient& client) {
+  sendHeader(client, "application/json");
+
+  client.print("{");
+  client.print("\"deep_m\":");
+  client.print(TARGET_DEEP_M, 3);
+  client.print(",");
+
+  client.print("\"shallow_m\":");
+  client.print(TARGET_SHALLOW_M, 3);
+  client.print(",");
+
+  client.print("\"surface_m\":");
+  client.print(TARGET_SURFACE_M, 3);
+  client.print(",");
+
+  client.print("\"hold_ms\":");
+  client.print(HOLD_TIME_MS);
+  client.print(",");
+
+  client.print("\"tol_m\":");
+  client.print(TARGET_TOLERANCE_M, 3);
+  client.print(",");
+
+  client.print("\"surface_tol_m\":");
+  client.print(SURFACE_TOLERANCE_M, 3);
+  client.print(",");
+
+  client.print("\"max_transit_ms\":");
+  client.print(MAX_TRANSIT_TIME_MS);
+  client.print(",");
+
+  client.print("\"max_hold_ms\":");
+  client.print(MAX_HOLD_TIME_MS);
+  client.print(",");
+
+  client.print("\"max_recover_ms\":");
+  client.print(MAX_RECOVER_TIME_MS);
+
+  client.print("}");
+}
+
+void handleSetMission(WiFiClient& client, const String& request) {
+  TARGET_DEEP_M        = getQueryParam(request, "deep", TARGET_DEEP_M);
+  TARGET_SHALLOW_M     = getQueryParam(request, "shallow", TARGET_SHALLOW_M);
+  TARGET_SURFACE_M     = getQueryParam(request, "surface", TARGET_SURFACE_M);
+  HOLD_TIME_MS         = getQueryParamULong(request, "hold", HOLD_TIME_MS);
+  TARGET_TOLERANCE_M   = getQueryParam(request, "tol", TARGET_TOLERANCE_M);
+  SURFACE_TOLERANCE_M  = getQueryParam(request, "stol", SURFACE_TOLERANCE_M);
+  MAX_TRANSIT_TIME_MS  = getQueryParamULong(request, "maxtransit", MAX_TRANSIT_TIME_MS);
+  MAX_HOLD_TIME_MS     = getQueryParamULong(request, "maxhold", MAX_HOLD_TIME_MS);
+  MAX_RECOVER_TIME_MS  = getQueryParamULong(request, "maxrecover", MAX_RECOVER_TIME_MS);
+
+  // Basic sanity guards
+  if (TARGET_DEEP_M < 0.0f) TARGET_DEEP_M = 0.0f;
+  if (TARGET_SHALLOW_M < 0.0f) TARGET_SHALLOW_M = 0.0f;
+  if (TARGET_SURFACE_M < 0.0f) TARGET_SURFACE_M = 0.0f;
+
+  if (TARGET_TOLERANCE_M < 0.001f) TARGET_TOLERANCE_M = 0.001f;
+  if (SURFACE_TOLERANCE_M < 0.001f) SURFACE_TOLERANCE_M = 0.001f;
+
+  if (HOLD_TIME_MS < 1000) HOLD_TIME_MS = 1000;
+  if (MAX_TRANSIT_TIME_MS < 1000) MAX_TRANSIT_TIME_MS = 1000;
+  if (MAX_HOLD_TIME_MS < 1000) MAX_HOLD_TIME_MS = 1000;
+  if (MAX_RECOVER_TIME_MS < 1000) MAX_RECOVER_TIME_MS = 1000;
+
+  // Reset timing/PID so current state uses new settings cleanly
+  stateEntryMillis = millis();
+  inToleranceStartMillis = 0;
+  inToleranceTimerRunning = false;
+  resetPID();
+
+  Serial.println("Mission settings updated:");
+  Serial.print("Deep: "); Serial.println(TARGET_DEEP_M, 3);
+  Serial.print("Shallow: "); Serial.println(TARGET_SHALLOW_M, 3);
+  Serial.print("Surface: "); Serial.println(TARGET_SURFACE_M, 3);
+  Serial.print("Hold ms: "); Serial.println(HOLD_TIME_MS);
+  Serial.print("Tol m: "); Serial.println(TARGET_TOLERANCE_M, 3);
+  Serial.print("Surface tol m: "); Serial.println(SURFACE_TOLERANCE_M, 3);
+  Serial.print("Max transit ms: "); Serial.println(MAX_TRANSIT_TIME_MS);
+  Serial.print("Max hold ms: "); Serial.println(MAX_HOLD_TIME_MS);
+  Serial.print("Max recover ms: "); Serial.println(MAX_RECOVER_TIME_MS);
+
+  sendMission(client);
 }
 
 void sendManual(WiFiClient& client) {
@@ -1118,6 +1286,21 @@ canvas {
 </div>
 
 <div class="card">
+  <h2>Mission Settings</h2>
+  <div class="med">Deep target (m): <input id="deepTarget" type="number" step="0.01"></div>
+  <div class="med">Shallow target (m): <input id="shallowTarget" type="number" step="0.01"></div>
+  <div class="med">Surface target (m): <input id="surfaceTarget" type="number" step="0.01"></div>
+  <div class="med">Hold time (ms): <input id="holdMs" type="number" step="1000"></div>
+  <div class="med">Target tolerance (m): <input id="tolM" type="number" step="0.01"></div>
+  <div class="med">Surface tolerance (m): <input id="surfaceTolM" type="number" step="0.01"></div>
+  <div class="med">Max transit (ms): <input id="maxTransitMs" type="number" step="1000"></div>
+  <div class="med">Max hold (ms): <input id="maxHoldMs" type="number" step="1000"></div>
+  <div class="med">Max recover (ms): <input id="maxRecoverMs" type="number" step="1000"></div>
+  <button class="button startBtn" onclick="applyMission()">APPLY MISSION</button>
+  <div class="med" id="missionStatus">Mission: --</div>
+</div>
+
+<div class="card">
   <h2>PID Tuning</h2>
   <div class="med">Kp: <input id="kp" type="number" step="0.1"></div>
   <div class="med">Ki: <input id="ki" type="number" step="0.1"></div>
@@ -1223,6 +1406,44 @@ function applyManualUs() {
     .then(data => {
       document.getElementById('manualMode').innerText = data.enabled ? 'ON' : 'OFF';
       document.getElementById('manualUs').value = data.manual_us;
+    });
+}
+
+function loadMission() {
+  fetch('/mission')
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('deepTarget').value = data.deep_m;
+      document.getElementById('shallowTarget').value = data.shallow_m;
+      document.getElementById('surfaceTarget').value = data.surface_m;
+      document.getElementById('holdMs').value = data.hold_ms;
+      document.getElementById('tolM').value = data.tol_m;
+      document.getElementById('surfaceTolM').value = data.surface_tol_m;
+      document.getElementById('maxTransitMs').value = data.max_transit_ms;
+      document.getElementById('maxHoldMs').value = data.max_hold_ms;
+      document.getElementById('maxRecoverMs').value = data.max_recover_ms;
+
+      document.getElementById('missionStatus').innerText =
+        `Mission: deep=${data.deep_m} m, shallow=${data.shallow_m} m, hold=${data.hold_ms} ms`;
+    });
+}
+
+function applyMission() {
+  const deep = document.getElementById('deepTarget').value;
+  const shallow = document.getElementById('shallowTarget').value;
+  const surface = document.getElementById('surfaceTarget').value;
+  const hold = document.getElementById('holdMs').value;
+  const tol = document.getElementById('tolM').value;
+  const stol = document.getElementById('surfaceTolM').value;
+  const maxtransit = document.getElementById('maxTransitMs').value;
+  const maxhold = document.getElementById('maxHoldMs').value;
+  const maxrecover = document.getElementById('maxRecoverMs').value;
+
+  fetch(`/setmission?deep=${encodeURIComponent(deep)}&shallow=${encodeURIComponent(shallow)}&surface=${encodeURIComponent(surface)}&hold=${encodeURIComponent(hold)}&tol=${encodeURIComponent(tol)}&stol=${encodeURIComponent(stol)}&maxtransit=${encodeURIComponent(maxtransit)}&maxhold=${encodeURIComponent(maxhold)}&maxrecover=${encodeURIComponent(maxrecover)}`)
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('missionStatus').innerText =
+        `Mission: deep=${data.deep_m} m, shallow=${data.shallow_m} m, hold=${data.hold_ms} ms`;
     });
 }
 
@@ -1407,6 +1628,7 @@ updatePressure();
 updateStatus();
 loadPID();
 loadManual();
+loadMission();
 </script>
 
 </body>
