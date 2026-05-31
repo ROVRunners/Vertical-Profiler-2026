@@ -60,9 +60,9 @@ const int CONTROL_DIRECTION = 1;
 int actuatorCommandUs = -1;
 
 // ===== PID tuning =====
-float PID_KP = 700.0f;
-float PID_KI = 0.0f;
-float PID_KD = 0.0f;
+float PID_KP = 400.0f;
+float PID_KI = 10.0f;
+float PID_KD = 1100.0f;
 
 // Integral clamp to prevent windup
 float PID_INTEGRAL_MIN = -1.5f;
@@ -72,11 +72,11 @@ float PID_INTEGRAL_MAX =  1.5f;
 const unsigned long PID_INTERVAL_MS = 100;
 
 // ===== Mission targets =====
-float TARGET_DEEP_M = 0.60f;
+float TARGET_DEEP_M = 2.50f;
 float TARGET_SHALLOW_M = 0.40f;
 float TARGET_SURFACE_M = 0.02f;
-unsigned long HOLD_TIME_MS = 30000;
-float TARGET_TOLERANCE_M = 0.05f;
+unsigned long HOLD_TIME_MS = 32000;
+float TARGET_TOLERANCE_M = 0.15f;
 float SURFACE_TOLERANCE_M = 0.05f;
 unsigned long MAX_TRANSIT_TIME_MS = 90000;
 unsigned long MAX_HOLD_TIME_MS = 60000;
