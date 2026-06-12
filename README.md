@@ -1,431 +1,124 @@
-# Vertical Profiler (VP)
+# Vertical Profiler 2026
 
-This project is a small autonomous vertical profiler built around an ESP32-C3, a buoyancy engine actuator, a Bar02 pressure sensor, an RTC, and a NeoPixel status display. The system creates its own Wi-Fi access point, hosts a local control page, runs a mission profile in the water, logs depth over time, and displays live status information to the operator.
+This repository contains the design files, firmware, and project documentation for our 2026 Vertical Profiler.
 
-The VP is designed to move between target depths, hold within a specified tolerance band, and record its motion for later review. It also includes manual mode, onboard visual status indicators, and live PID tuning through the client page.
+The profiler was built for the 2026 MATE ROV competition. The goal was to make a small, reliable vertical profiler that could work in a cold glycol environment, survive the required depth, and still stay simple and affordable.
 
----
+The final design is a transparent PVC float with a syringe-based buoyancy engine, ESP32-C3 control board, Bar02 pressure sensor, RTC, onboard NeoPixel status display, and a Wi-Fi interface for mission control and tuning.
 
-## System Overview
+## Main features
 
-The VP is a depth-controlled profiling platform. It uses a pressure sensor to estimate depth and a buoyancy engine actuator to drive the vehicle upward or downward in the water column. A control loop compares the current depth to a target depth and adjusts the buoyancy engine command to reduce the error.
-
-The system can operate in three main ways:
-
-- **Idle mode**: waiting for user input
-- **Automatic mission mode**: running the programmed depth profile
-- **Manual mode**: operator directly commands actuator microseconds
-
-The VP serves a simple web interface over its own Wi-Fi access point. From that page, the operator can:
-
-- start a mission
-- stop logging
-- view live depth and pressure
-- view elapsed mission time
-- tune PID values live
-- enter manual mode
-- directly command actuator microsecond values
-- retrieve and graph logged depth data
-
----
-
-## Hardware Used
-
-This project is currently built around the following hardware:
-
-- **SparkFun Pro Micro ESP32-C3**
-- **Blue Robotics Bar02 pressure sensor**
-- **RTC module**
-- **Servo-style buoyancy engine actuator**
-- **7-pixel NeoPixel Jewel**
-- **External power system for actuator and electronics**
-
----
-
-## Main Features
-
-- Local Wi-Fi access point and web control page
-- Live depth and pressure readout
-- Automatic multi-step vertical profiling mission
-- Hold logic based on remaining within depth tolerance for the full hold period
-- Depth logging and graphing in the browser
-- Live PID tuning from the client
+- Rated for 5 m depth
+- Designed for low-temperature operation
+- Transparent PVC enclosure
+- Syringe-based buoyancy engine
+- ESP32-C3 based control system
+- Blue Robotics Bar02 pressure sensor
+- RTC for onboard timekeeping
+- NeoPixel LED status display
+- Wi-Fi access point control page
+- Live telemetry and depth graph
+- Adjustable mission settings from the client
+- Adjustable PID settings from the client
 - Manual actuator control mode
-- NeoPixel visual feedback for motion, state, depth error, and actuator command
-- Depth zeroing before mission start
+- Logged depth-over-time mission data
 
----
+The current firmware runs the profiler as its own Wi-Fi access point, uses I2C for the RTC and pressure sensor, drives the buoyancy actuator with servo-style PWM, and supports live mission control, PID tuning, manual mode, data logging, and LED state feedback. :contentReference[oaicite:0]{index=0}
 
-## How the VP Works
+## How it works
 
-### 1. Startup
+The profiler changes depth by moving a buoyancy engine. A pressure sensor is used to estimate depth, and the control loop adjusts the actuator command to move toward the target depth.
 
-When the VP powers on, it initializes the sensors, LED ring, and actuator. During startup it also performs a buoyancy engine prime cycle. This helps clear and prepare the buoyancy engine before the vehicle begins normal operation.
+Before a mission starts, the depth sensor is zeroed. Once started, the profiler runs a programmed sequence of depth targets and hold times. The current firmware is set up for a deep target, a shallow target, and an optional self-recovery to the surface after the final hold. :contentReference[oaicite:1]{index=1}
 
-After startup, the board creates a Wi-Fi access point. The operator connects to this network and opens the control page in a browser.
+The current mission profile is:
 
-### 2. Depth Sensing
+1. Descend to the deep target
+2. Hold depth for the required hold time
+3. Ascend to the shallow target
+4. Hold depth again
+5. Repeat the cycle
+6. Either stay shallow or recover to the surface, depending on mission settings
 
-Depth is measured using the Bar02 pressure sensor. The sensor reports pressure, and the software converts that pressure into depth using the configured fluid density.
+The default firmware values currently use a deep target of 2.50 m, a shallow target of 0.40 m, a surface target of 0.02 m, a 32 second hold time, and timeout limits for transit, hold, and recovery states. :contentReference[oaicite:2]{index=2}
 
-Before a mission starts, the VP performs a **depth zeroing step**. It samples the pressure sensor several times, averages those readings, and stores that average as the depth zero offset. All later depth readings are referenced to that zero point.
+## Control interface
 
-That means:
+The profiler hosts a browser-based control page over Wi-Fi, so there is no separate base station required. The web interface includes:
 
-- `0.00 m` represents the depth at the moment the vehicle was zeroed
-- positive depth means deeper than the zeroing point
+- Start and stop mission controls
+- Live elapsed time
+- RTC readout
+- Live pressure and depth
+- State and actuator readout
+- Depth-over-time graph
+- Mission setting controls
+- PID tuning controls
+- Manual actuator mode
 
-### 3. Mission Control
+The current firmware uses the SSID `VP_Float` and serves the control interface from the ESP32-C3 in AP mode. :contentReference[oaicite:3]{index=3}
 
-When the operator presses **Start Logging**, the VP:
+## LED feedback
 
-1. exits manual mode if needed
-2. zeroes the depth sensor
-3. enters the first descent state
-4. begins logging depth over time
+The 7-pixel NeoPixel Jewel is used as a quick operator display.
 
-The mission state machine then moves through the programmed sequence of target depths and hold periods.
+- LEDs 1–2 show vertical velocity
+- LED 3 shows system state
+- LEDs 4–5 show how close the profiler is to the current target depth
+- LEDs 6–7 show actuator command
 
-### 4. PID Depth Control
+There are also special LED indications for manual mode and depth zeroing. :contentReference[oaicite:4]{index=4}
 
-The VP uses a PID loop to command the buoyancy engine. The controller compares:
+## Hardware summary
 
-- **target depth**
-- **measured depth**
+Main hardware used in the current build:
 
-and computes an output in actuator microseconds.
+- SparkFun Pro Micro ESP32-C3
+- Blue Robotics Bar02 pressure sensor
+- DS1307 RTC
+- Servo-driven buoyancy actuator
+- NeoPixel Jewel
+- Transparent PVC enclosure
 
-The PID terms mean:
+The current firmware is written around those devices and uses the ESP32-C3’s Wi-Fi, I2C, and PWM features to run the system. :contentReference[oaicite:5]{index=5}
 
-- **P (proportional)**: reacts to present depth error
-- **I (integral)**: reacts to accumulated error over time
-- **D (derivative)**: reacts to how quickly the error is changing
+## Repository structure
 
-This output is then translated into a microsecond command sent to the buoyancy actuator.
+This repo is intended to hold the full project, including:
 
-### 5. Logging
+- mechanical design files
+- electronics design files
+- firmware
+- test notes
+- project documentation
+- photos and supporting media
 
-The VP logs:
+## Current firmware notes
 
-- elapsed time since mission start
-- depth
+The current firmware supports:
 
-These are stored in RAM during the mission and sent to the web client when requested. The web page plots **depth vs time** so the operator can see the vehicle profile.
+- onboard depth zeroing before mission start
+- actuator priming at startup
+- PID depth control
+- mission state machine control
+- hold timing that resets if the profiler leaves tolerance
+- sample logging in RAM
+- mission and PID updates from the client
+- manual actuator override
+- onboard LED status feedback
 
----
+The current actuator range is 500 to 2500 microseconds, with 1500 microseconds as neutral. The firmware also includes a manual mode and adjustable mission parameters through the web page. :contentReference[oaicite:6]{index=6}
 
-## Mission Logic
+## Project goals
 
-The mission sequence is organized as a state machine.
+This project was built to meet the MATE competition requirements while also giving us a platform that was easy to test, easy to tune, and cheap enough to build without overcomplicating the design.
 
-A typical mission may look like this:
+A big part of the project was making something that could be adjusted quickly in testing. That is why so much of the software was focused on live tuning, telemetry, and usability instead of just running one fixed script.
 
-1. descend to deep target
-2. hold for 30 seconds
-3. ascend to shallow target
-4. hold for 30 seconds
-5. repeat as required
-6. either hold shallow or self-recover to surface
+## Status
 
-### Important Hold Behavior
+This project is functional and actively being tested and revised. The hardware, software, and control system have all gone through multiple revisions, especially in the buoyancy engine and controls.
 
-The VP does **not** simply wait 30 seconds after reaching a target once. It must stay **within the allowed target tolerance band continuously** for the full hold time.
+## More documentation
 
-If it drifts outside the tolerance:
-
-- the hold timer resets
-- the VP must re-enter and remain inside the band again for the full hold period
-
-This behavior is important because it ensures the vehicle truly holds station at the required depth rather than just briefly touching the target.
-
----
-
-## Manual Mode
-
-Manual mode is intended for direct operator testing and troubleshooting.
-
-When manual mode is enabled:
-
-- automatic mission logic is suspended
-- the operator can directly write actuator microsecond values
-- the actuator holds the commanded value until changed or manual mode is exited
-
-This is useful for:
-
-- testing the buoyancy engine
-- checking actuator direction
-- finding neutral or trim points
-- verifying wiring and hardware behavior
-
----
-
-## Web Interface
-
-The VP hosts a browser-based control page. This is the main operator interface.
-
-### Main Controls
-
-- **START LOGGING**  
-  Begins the mission, zeroes depth, and starts depth logging.
-
-- **STOP LOGGING**  
-  Stops logging and returns the VP to idle behavior.
-
-### Status Display
-
-The page shows:
-
-- **Elapsed time**
-- **RTC time**
-- **Pressure**
-- **Depth**
-- **Current state**
-- **Sample count**
-- **Actuator microseconds**
-
-### PID Tuning Panel
-
-The PID panel allows the operator to edit:
-
-- `Kp`
-- `Ki`
-- `Kd`
-
-without reflashing the firmware.
-
-When applied, the new values take effect immediately in RAM.
-
-### Manual Control Panel
-
-The manual control panel allows the operator to:
-
-- enable manual mode
-- disable manual mode
-- enter a raw actuator microsecond command
-
----
-
-## What the Information Means
-
-### Elapsed Time
-
-This is the mission runtime in seconds. It shows how long the VP has been logging since the mission started.
-
-### RTC Time
-
-This is the current date and time from the onboard RTC. It is useful for correlating mission runs and system events.
-
-### Pressure
-
-This is the raw pressure sensor reading in mbar. It is the measured fluid pressure and is the source value used to derive depth.
-
-### Depth
-
-This is the zero-referenced depth in meters.
-
-Examples:
-
-- `0.00 m` = same depth as the point where the mission was zeroed
-- `0.40 m` = 40 cm below the zero point
-- `0.60 m` = 60 cm below the zero point
-
-### State
-
-The state tells you what the VP is trying to do right now.
-
-Examples:
-
-- `IDLE` = waiting
-- `DESCEND_*` = driving deeper
-- `ASCEND_*` = driving shallower
-- `HOLD_*` = maintaining a target depth
-- `STATION_KEEP_*` = remaining at target after the profile
-- `RECOVER_SURFACE` = recovering upward
-- `MANUAL` = operator-controlled actuator mode
-
-### Samples
-
-This is the number of logged depth samples currently stored in memory.
-
-### Actuator Command
-
-This is the actual microsecond command being sent to the buoyancy engine actuator.
-
-This value is important because it tells you what the controller is trying to do physically.
-
----
-
-## NeoPixel LED Meanings
-
-The VP uses a 7-pixel NeoPixel Jewel as a compact visual status display. Each section of the ring has a different purpose.
-
-### LEDs 1–2: Vertical Velocity
-
-These LEDs show how the VP is moving in the water.
-
-- **Yellow** = moving upward
-- **Purple** = moving downward
-- stronger color = larger vertical speed
-
-The display is scaled to about **0.2 m/s** maximum expected velocity.
-
-### LED 3: State Indicator
-
-This LED shows the current operating state of the VP.
-
-- **Blinking blue** = idle
-- **Magenta** = descending
-- **Red** = deep hold
-- **Amber** = ascending
-- **Green** = shallow hold
-- **White** = station keeping
-
-This LED is meant to give quick, high-level mission awareness.
-
-### LEDs 4–5: Target Depth Position
-
-These LEDs show how close the VP is to the current target depth band.
-
-- **Bright pink** = exactly on target
-- **Pink fading to black** = within tolerance but farther from target
-- **Blinking red** = outside the allowed target tolerance
-
-These LEDs are especially useful during hold states because they show whether the VP is actually centered on the target or just barely staying within bounds.
-
-### LEDs 6–7: Buoyancy Engine Command
-
-These LEDs show the actuator command being sent to the buoyancy engine.
-
-- **Blue** = low end of the command range
-- **Orange** = high end of the command range
-- the color shifts gradually between the two
-
-This gives immediate visual feedback about what the controller is asking the actuator to do.
-
-### Manual Mode Override
-
-In manual mode, **all 7 LEDs blink yellow**.
-
-This overrides the normal LED meanings and clearly indicates that automatic mission control is not active.
-
-### Depth Zeroing Indication
-
-During the depth zeroing process before a mission begins, **all 7 LEDs blink yellow quickly**.
-
-This shows that the vehicle is in a short startup calibration phase before it begins diving.
-
----
-
-## Target Tolerance
-
-The VP uses a target tolerance band around each depth setpoint.
-
-For example, if the target is:
-
-- `0.40 m`
-- tolerance = `±0.05 m`
-
-then the acceptable band is:
-
-- `0.35 m` to `0.45 m`
-
-The profiler must remain inside that band continuously for the hold timer to complete.
-
-This matters because simply crossing the target is not enough. The VP must demonstrate stable control at the desired depth.
-
----
-
-## Logging Parameters
-
-The VP stores depth logs in memory. The two main parameters are:
-
-- `MAX_SAMPLES`
-- `SAMPLE_INTERVAL_MS`
-
-These determine:
-
-- how often data is logged
-- how long a full mission can be recorded before memory fills
-
-For example:
-
-- smaller sample interval = more detail, shorter total runtime
-- larger sample interval = less detail, longer total runtime
-
-A good balanced setting is often around **250 ms** sample interval if you want decent profile detail without using too much memory.
-
----
-
-## Typical Operating Procedure
-
-1. Power on the VP.
-2. Wait for startup and buoyancy engine priming to finish.
-3. Connect to the VP Wi-Fi access point.
-4. Open the client page in a browser.
-5. Verify live pressure, depth, and system status.
-6. Adjust PID values if needed.
-7. Press **START LOGGING**.
-8. Wait while the VP zeroes depth.
-9. Let the VP run its programmed profile.
-10. Retrieve the VP when the mission is complete.
-11. Press **STOP LOGGING**.
-12. Review the depth graph and saved data.
-
----
-
-## Tuning Notes
-
-### PID Tuning
-
-If the VP oscillates too much:
-
-- reduce `Kp`
-- add or increase `Kd`
-
-If the VP responds too weakly:
-
-- increase `Kp`
-
-If it consistently sits above or below the target:
-
-- increase `Ki` slightly
-
-### Manual Mode
-
-Manual mode is often the fastest way to:
-
-- confirm actuator direction
-- verify your microsecond range
-- check if the buoyancy engine is behaving as expected
-
-### Depth Zeroing
-
-Always zero the VP at the correct reference depth before starting a mission. If the zero point is wrong, every depth reading during the mission will be shifted.
-
----
-
-## Safety and Operational Notes
-
-- Do not assume manual mode is safe for autonomous use.
-- Make sure the actuator command range is correct for your hardware.
-- Verify control direction before running a full mission.
-- Confirm that the pressure sensor is stable before starting.
-- Watch the LED indications during testing, especially target-bound and manual-mode indicators.
-
----
-
-## Future Improvements
-
-Potential future additions include:
-
-- persistent storage of PID values
-- download/export of logged mission data
-- additional logged channels such as pressure, velocity, and actuator command
-- improved graphing and mission summary tools
-- mission configuration from the web client
-
----
-
-## Repository Purpose
-
-This repository documents the firmware, operator interface, and control behavior of the Vertical Profiler. Its purpose is to make the VP easy to understand, operate, test, and improve for future missions.
+More detailed project writeups, photos, and supporting files are included elsewhere in this repository and in the linked project documentation.
