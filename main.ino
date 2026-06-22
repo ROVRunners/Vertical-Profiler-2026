@@ -10,7 +10,7 @@
 const char* TEAM_ID = "EX01";
 
 // ===== Mission options =====
-const bool SELF_RECOVER_TO_SURFACE = true;   // false = stay at 0.40 m, true = surface after final hold
+const bool SELF_RECOVER_TO_SURFACE = false;   // false = stay at 0.40 m, true = surface after final hold
 
 // ===== WiFi AP config =====
 const char* ssid = "VP_Float";
@@ -59,24 +59,33 @@ const int CONTROL_DIRECTION = 1;
 
 int actuatorCommandUs = -1;
 
-// ===== PID tuning =====
-float PID_KP = 400.0f;
-float PID_KI = 10.0f;
-float PID_KD = 1100.0f;
+// ===== 5-state depth controller tuning =====
+// Positive depth error means the VP is too shallow and needs to go deeper.
+// The controller uses five actions:
+//   FAR SHALLOW   -> fast deeper command
+//   NEAR SHALLOW  -> slow deeper command
+//   IN WINDOW     -> neutral command
+//   NEAR DEEP     -> slow shallower command
+//   FAR DEEP      -> fast shallower command
+//
+// The command offsets are centered around ACTUATOR_NEUTRAL_US and are converted
+// through CONTROL_DIRECTION so you can flip actuator polarity in one place.
+float CTRL_INNER_WINDOW_M = 0.05f;       // inside this window, command neutral
+float CTRL_OUTER_WINDOW_M = 0.15f;       // outside this window, use fast command
+float CTRL_SLOW_OFFSET_US = 300.0f;      // neutral +/- this near target
+float CTRL_FAST_OFFSET_US = 900.0f;      // neutral +/- this far from target
 
-// Integral clamp to prevent windup
-float PID_INTEGRAL_MIN = -1.5f;
-float PID_INTEGRAL_MAX =  1.5f;
+// Controller update rate
+const unsigned long CONTROL_INTERVAL_MS = 100;
 
-// PID update rate
-const unsigned long PID_INTERVAL_MS = 100;
+const char* controlAction = "IDLE";
 
 // ===== Mission targets =====
 float TARGET_DEEP_M = 2.50f;
 float TARGET_SHALLOW_M = 0.40f;
 float TARGET_SURFACE_M = 0.02f;
 unsigned long HOLD_TIME_MS = 32000;
-float TARGET_TOLERANCE_M = 0.15f;
+float TARGET_TOLERANCE_M = 0.20f;
 float SURFACE_TOLERANCE_M = 0.05f;
 unsigned long MAX_TRANSIT_TIME_MS = 90000;
 unsigned long MAX_HOLD_TIME_MS = 60000;
@@ -93,6 +102,7 @@ const int PIXEL_COUNT = 7;
 Adafruit_NeoPixel pixels(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 float liveVelocity_mps = 0.0f;
+bool resetVelocityEstimate = false;
 
 // ===== LED behavior =====
 const float MAX_DISPLAY_VELOCITY_MPS = 0.20f;
@@ -119,9 +129,11 @@ enum State {
 State currentState = IDLE;
 
 // ===== Logging =====
-const int MAX_SAMPLES = 2000;
+const int MAX_SAMPLES = 3000;
 unsigned long timeLog[MAX_SAMPLES];
 float depthLog[MAX_SAMPLES];
+float targetLog[MAX_SAMPLES];
+float toleranceLog[MAX_SAMPLES];
 int sampleCount = 0;
 
 bool loggingEnabled = false;
@@ -134,10 +146,8 @@ unsigned long stateEntryMillis = 0;
 unsigned long inToleranceStartMillis = 0;
 bool inToleranceTimerRunning = false;
 
-// ===== PID state =====
-float pidIntegral = 0.0f;
-float pidPrevError = 0.0f;
-unsigned long lastPidMillis = 0;
+// ===== Controller state =====
+unsigned long lastControlMillis = 0;
 
 // ===== Live values =====
 float livePressure_mbar = 0.0f;
@@ -175,10 +185,11 @@ void sendMission(WiFiClient& client);
 void handleSetMission(WiFiClient& client, const String& request);
 unsigned long getQueryParamULong(const String& request, const String& key, unsigned long currentValue);
 
-void resetPID();
-void runDepthPID(float targetDepthM);
-void sendPID(WiFiClient& client);
-void handleSetPID(WiFiClient& client, const String& request);
+void resetController();
+void runDepthController(float targetDepthM);
+int depthCommandFromOffset(float offsetUs);
+void sendController(WiFiClient& client);
+void handleSetController(WiFiClient& client, const String& request);
 float getQueryParam(const String& request, const String& key, float currentValue);
 void zeroDepthSensor();
 void logSampleIfNeeded();
@@ -277,7 +288,7 @@ void enterState(State newState) {
   stateEntryMillis = millis();
   inToleranceStartMillis = 0;
   inToleranceTimerRunning = false;
-  resetPID();
+  resetController();
   updateStateLEDs();
 
   Serial.print("Entered state: ");
@@ -553,9 +564,10 @@ void updateSensors() {
     rawDepth_m = pressureSensor.depth();
     liveDepth_m = rawDepth_m - depthZeroOffset_m;
 
-    if (firstRun || dt <= 0.0f) {
+    if (firstRun || resetVelocityEstimate || dt <= 0.0f) {
       liveVelocity_mps = 0.0f;
       firstRun = false;
+      resetVelocityEstimate = false;
     } else {
       liveVelocity_mps = (liveDepth_m - prevDepth_m) / dt;
     }
@@ -564,38 +576,86 @@ void updateSensors() {
   }
 }
 
-// ===== PID =====
-void resetPID() {
-  pidIntegral = 0.0f;
-  pidPrevError = 0.0f;
-  lastPidMillis = millis();
+// ===== 5-state depth controller =====
+void resetController() {
+  lastControlMillis = millis();
+  controlAction = "RESET";
 }
 
-void runDepthPID(float targetDepthM) {
-  unsigned long now = millis();
-  if (now - lastPidMillis < PID_INTERVAL_MS) return;
+int depthCommandFromOffset(float offsetUs) {
+  // offsetUs > 0 means command the VP to go deeper.
+  // offsetUs < 0 means command the VP to go shallower.
+  int commandUs = (int)(ACTUATOR_NEUTRAL_US + CONTROL_DIRECTION * offsetUs);
 
-  float dt = (now - lastPidMillis) / 1000.0f;
-  lastPidMillis = now;
+  if (commandUs < ACTUATOR_MIN_US) commandUs = ACTUATOR_MIN_US;
+  if (commandUs > ACTUATOR_MAX_US) commandUs = ACTUATOR_MAX_US;
+
+  return commandUs;
+}
+
+void runDepthController(float targetDepthM) {
+  unsigned long now = millis();
+  if (now - lastControlMillis < CONTROL_INTERVAL_MS) return;
+  lastControlMillis = now;
 
   float error = targetDepthM - liveDepth_m;
+  float absError = fabs(error);
 
-  pidIntegral += error * dt;
-  if (pidIntegral > PID_INTEGRAL_MAX) pidIntegral = PID_INTEGRAL_MAX;
-  if (pidIntegral < PID_INTEGRAL_MIN) pidIntegral = PID_INTEGRAL_MIN;
-
-  float derivative = 0.0f;
-  if (dt > 0.0f) {
-    derivative = (error - pidPrevError) / dt;
+  // Keep the controller settings sane if values are changed from the web page.
+  if (CTRL_INNER_WINDOW_M < 0.001f) CTRL_INNER_WINDOW_M = 0.001f;
+  if (CTRL_OUTER_WINDOW_M <= CTRL_INNER_WINDOW_M) {
+    CTRL_OUTER_WINDOW_M = CTRL_INNER_WINDOW_M + 0.001f;
   }
-  pidPrevError = error;
+  if (CTRL_SLOW_OFFSET_US < 0.0f) CTRL_SLOW_OFFSET_US = 0.0f;
+  if (CTRL_FAST_OFFSET_US < CTRL_SLOW_OFFSET_US) {
+    CTRL_FAST_OFFSET_US = CTRL_SLOW_OFFSET_US;
+  }
 
-  float outputUs =
-      CONTROL_DIRECTION *
-      (PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative);
+  int commandUs = ACTUATOR_NEUTRAL_US;
 
-  int commandUs = (int)(ACTUATOR_NEUTRAL_US + outputUs);
+  if (absError <= CTRL_INNER_WINDOW_M) {
+    // State 3: inside target window. Do not chase noise.
+    commandUs = ACTUATOR_NEUTRAL_US;
+    controlAction = "HOLD_WINDOW";
+  }
+  else if (error > CTRL_OUTER_WINDOW_M) {
+    // State 1: VP is far above/shallower than target. Move down quickly.
+    commandUs = depthCommandFromOffset(CTRL_FAST_OFFSET_US);
+    controlAction = "FAST_DEEPER";
+  }
+  else if (error > CTRL_INNER_WINDOW_M) {
+    // State 2: VP is just above/shallower than target. Move down gently.
+    commandUs = depthCommandFromOffset(CTRL_SLOW_OFFSET_US);
+    controlAction = "SLOW_DEEPER";
+  }
+  else if (error < -CTRL_OUTER_WINDOW_M) {
+    // State 5: VP is far below/deeper than target. Move up quickly.
+    commandUs = depthCommandFromOffset(-CTRL_FAST_OFFSET_US);
+    controlAction = "FAST_SHALLOWER";
+  }
+  else {
+    // State 4: VP is just below/deeper than target. Move up gently.
+    commandUs = depthCommandFromOffset(-CTRL_SLOW_OFFSET_US);
+    controlAction = "SLOW_SHALLOWER";
+  }
+
   setActuatorUs(commandUs);
+
+  static unsigned long lastDebugPrint = 0;
+  if (millis() - lastDebugPrint > 500) {
+    lastDebugPrint = millis();
+
+    Serial.print("Target:");
+    Serial.print(targetDepthM, 3);
+    Serial.print(" Depth:");
+    Serial.print(liveDepth_m, 3);
+    Serial.print(" Error:");
+    Serial.print(error, 3);
+    Serial.print(" Action:");
+    Serial.print(controlAction);
+    Serial.print(" Command:");
+    Serial.println(commandUs);
+  }
 }
 
 // ===== Zero depth =====
@@ -622,6 +682,9 @@ void zeroDepthSensor() {
   rawDepth_m = pressureSensor.depth();
   liveDepth_m = rawDepth_m - depthZeroOffset_m;
 
+  liveVelocity_mps = 0.0f;
+  resetVelocityEstimate = true;
+
   zeroingInProgress = false;
   updateStateLEDs();
 }
@@ -636,6 +699,15 @@ void logSampleIfNeeded() {
     if (sampleCount < MAX_SAMPLES) {
       timeLog[sampleCount] = millis() - loggingStartMillis;
       depthLog[sampleCount] = liveDepth_m;
+
+      if (stateHasTarget(currentState)) {
+        targetLog[sampleCount] = getCurrentTargetDepth();
+        toleranceLog[sampleCount] = getCurrentTargetTolerance();
+      } else {
+        targetLog[sampleCount] = 0.0f;
+        toleranceLog[sampleCount] = 0.0f;
+      }
+
       sampleCount++;
     }
   }
@@ -702,7 +774,7 @@ void runStateMachine() {
       break;
 
     case DESCEND_1:
-      runDepthPID(TARGET_DEEP_M);
+      runDepthController(TARGET_DEEP_M);
 
       if (isWithinTolerance(TARGET_DEEP_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_250_1);
@@ -714,7 +786,7 @@ void runStateMachine() {
       break;
 
     case HOLD_250_1:
-      runDepthPID(TARGET_DEEP_M);
+      runDepthController(TARGET_DEEP_M);
 
       if (holdCompleteAtTarget(TARGET_DEEP_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         enterState(ASCEND_1);
@@ -726,7 +798,7 @@ void runStateMachine() {
       break;
 
     case ASCEND_1:
-      runDepthPID(TARGET_SHALLOW_M);
+      runDepthController(TARGET_SHALLOW_M);
 
       if (isWithinTolerance(TARGET_SHALLOW_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_040_1);
@@ -738,7 +810,7 @@ void runStateMachine() {
       break;
 
     case HOLD_040_1:
-      runDepthPID(TARGET_SHALLOW_M);
+      runDepthController(TARGET_SHALLOW_M);
 
       if (holdCompleteAtTarget(TARGET_SHALLOW_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         enterState(DESCEND_2);
@@ -750,7 +822,7 @@ void runStateMachine() {
       break;
 
     case DESCEND_2:
-      runDepthPID(TARGET_DEEP_M);
+      runDepthController(TARGET_DEEP_M);
 
       if (isWithinTolerance(TARGET_DEEP_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_250_2);
@@ -762,7 +834,7 @@ void runStateMachine() {
       break;
 
     case HOLD_250_2:
-      runDepthPID(TARGET_DEEP_M);
+      runDepthController(TARGET_DEEP_M);
 
       if (holdCompleteAtTarget(TARGET_DEEP_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         enterState(ASCEND_2);
@@ -774,7 +846,7 @@ void runStateMachine() {
       break;
 
     case ASCEND_2:
-      runDepthPID(TARGET_SHALLOW_M);
+      runDepthController(TARGET_SHALLOW_M);
 
       if (isWithinTolerance(TARGET_SHALLOW_M, TARGET_TOLERANCE_M)) {
         enterState(HOLD_040_2);
@@ -786,7 +858,7 @@ void runStateMachine() {
       break;
 
     case HOLD_040_2:
-      runDepthPID(TARGET_SHALLOW_M);
+      runDepthController(TARGET_SHALLOW_M);
 
       if (holdCompleteAtTarget(TARGET_SHALLOW_M, TARGET_TOLERANCE_M, HOLD_TIME_MS)) {
         if (SELF_RECOVER_TO_SURFACE) {
@@ -806,11 +878,11 @@ void runStateMachine() {
       break;
 
     case STATION_KEEP_040:
-      runDepthPID(TARGET_SHALLOW_M);
+      runDepthController(TARGET_SHALLOW_M);
       break;
 
     case RECOVER_SURFACE:
-      runDepthPID(TARGET_SURFACE_M);
+      runDepthController(TARGET_SURFACE_M);
 
       if (isWithinTolerance(TARGET_SURFACE_M, SURFACE_TOLERANCE_M)) {
         setActuatorUs(ACTUATOR_IDLE_US);
@@ -864,10 +936,10 @@ void handleClient() {
     sendData(client);
   }
   else if (request.indexOf("GET /pid") >= 0) {
-    sendPID(client);
+    sendController(client);
   }
   else if (request.indexOf("GET /setpid") >= 0) {
-    handleSetPID(client, request);
+    handleSetController(client, request);
   }
     else if (request.indexOf("GET /manual") >= 0) {
     sendManual(client);
@@ -974,6 +1046,11 @@ void sendStatus(WiFiClient& client) {
   client.print(actuatorCommandUs);
 
   client.print(",");
+  client.print("\"control_action\":\"");
+  client.print(controlAction);
+  client.print("\"");
+
+  client.print(",");
   client.print("\"manual_mode\":");
   client.print(manualModeEnabled ? "true" : "false");
   client.print(",");
@@ -998,6 +1075,19 @@ void sendData(WiFiClient& client) {
     client.print(depthLog[i], 3);
     if (i < sampleCount - 1) client.print(",");
   }
+
+  client.print("],\"target\":[");
+  for (int i = 0; i < sampleCount; i++) {
+    client.print(targetLog[i], 3);
+    if (i < sampleCount - 1) client.print(",");
+  }
+
+  client.print("],\"tolerance\":[");
+  for (int i = 0; i < sampleCount; i++) {
+    client.print(toleranceLog[i], 3);
+    if (i < sampleCount - 1) client.print(",");
+  }
+
   client.print("]}");
 }
 
@@ -1052,36 +1142,67 @@ unsigned long getQueryParamULong(const String& request, const String& key, unsig
   return (unsigned long)valueStr.toInt();
 }
 
-void sendPID(WiFiClient& client) {
+void sendController(WiFiClient& client) {
   sendHeader(client, "application/json");
 
   client.print("{");
-  client.print("\"kp\":");
-  client.print(PID_KP, 4);
+  client.print("\"inner_m\":");
+  client.print(CTRL_INNER_WINDOW_M, 4);
   client.print(",");
-  client.print("\"ki\":");
-  client.print(PID_KI, 4);
+  client.print("\"outer_m\":");
+  client.print(CTRL_OUTER_WINDOW_M, 4);
   client.print(",");
-  client.print("\"kd\":");
-  client.print(PID_KD, 4);
+  client.print("\"slow_us\":");
+  client.print(CTRL_SLOW_OFFSET_US, 1);
+  client.print(",");
+  client.print("\"fast_us\":");
+  client.print(CTRL_FAST_OFFSET_US, 1);
+  client.print(",");
+  client.print("\"action\":\"");
+  client.print(controlAction);
+  client.print("\"");
+  client.print(",");
+  client.print("\"neutral_us\":");
+  client.print(ACTUATOR_NEUTRAL_US);
+  client.print(",");
+  client.print("\"deeper_slow_us\":");
+  client.print(depthCommandFromOffset(CTRL_SLOW_OFFSET_US));
+  client.print(",");
+  client.print("\"deeper_fast_us\":");
+  client.print(depthCommandFromOffset(CTRL_FAST_OFFSET_US));
+  client.print(",");
+  client.print("\"shallower_slow_us\":");
+  client.print(depthCommandFromOffset(-CTRL_SLOW_OFFSET_US));
+  client.print(",");
+  client.print("\"shallower_fast_us\":");
+  client.print(depthCommandFromOffset(-CTRL_FAST_OFFSET_US));
   client.print("}");
 }
 
-void handleSetPID(WiFiClient& client, const String& request) {
-  PID_KP = getQueryParam(request, "kp", PID_KP);
-  PID_KI = getQueryParam(request, "ki", PID_KI);
-  PID_KD = getQueryParam(request, "kd", PID_KD);
+void handleSetController(WiFiClient& client, const String& request) {
+  CTRL_INNER_WINDOW_M = getQueryParam(request, "inner", CTRL_INNER_WINDOW_M);
+  CTRL_OUTER_WINDOW_M = getQueryParam(request, "outer", CTRL_OUTER_WINDOW_M);
+  CTRL_SLOW_OFFSET_US = getQueryParam(request, "slow", CTRL_SLOW_OFFSET_US);
+  CTRL_FAST_OFFSET_US = getQueryParam(request, "fast", CTRL_FAST_OFFSET_US);
 
-  resetPID();
+  if (CTRL_INNER_WINDOW_M < 0.001f) CTRL_INNER_WINDOW_M = 0.001f;
+  if (CTRL_OUTER_WINDOW_M <= CTRL_INNER_WINDOW_M) {
+    CTRL_OUTER_WINDOW_M = CTRL_INNER_WINDOW_M + 0.001f;
+  }
+  if (CTRL_SLOW_OFFSET_US < 0.0f) CTRL_SLOW_OFFSET_US = 0.0f;
+  if (CTRL_FAST_OFFSET_US < CTRL_SLOW_OFFSET_US) {
+    CTRL_FAST_OFFSET_US = CTRL_SLOW_OFFSET_US;
+  }
 
-  Serial.print("Updated PID -> Kp: ");
-  Serial.print(PID_KP, 4);
-  Serial.print(" Ki: ");
-  Serial.print(PID_KI, 4);
-  Serial.print(" Kd: ");
-  Serial.println(PID_KD, 4);
+  resetController();
 
-  sendPID(client);
+  Serial.println("Updated 5-state controller settings:");
+  Serial.print("Inner window m: "); Serial.println(CTRL_INNER_WINDOW_M, 4);
+  Serial.print("Outer window m: "); Serial.println(CTRL_OUTER_WINDOW_M, 4);
+  Serial.print("Slow offset us: "); Serial.println(CTRL_SLOW_OFFSET_US, 1);
+  Serial.print("Fast offset us: "); Serial.println(CTRL_FAST_OFFSET_US, 1);
+
+  sendController(client);
 }
 
 void sendMission(WiFiClient& client) {
@@ -1154,7 +1275,7 @@ void handleSetMission(WiFiClient& client, const String& request) {
   stateEntryMillis = millis();
   inToleranceStartMillis = 0;
   inToleranceTimerRunning = false;
-  resetPID();
+  resetController();
 
   Serial.println("Mission settings updated:");
   Serial.print("Deep: "); Serial.println(TARGET_DEEP_M, 3);
@@ -1301,12 +1422,14 @@ canvas {
 </div>
 
 <div class="card">
-  <h2>PID Tuning</h2>
-  <div class="med">Kp: <input id="kp" type="number" step="0.1"></div>
-  <div class="med">Ki: <input id="ki" type="number" step="0.1"></div>
-  <div class="med">Kd: <input id="kd" type="number" step="0.1"></div>
-  <button class="button startBtn" onclick="applyPID()">APPLY PID</button>
-  <div class="med" id="pidStatus">PID: --</div>
+  <h2>5-State Controller</h2>
+  <div class="med">Inner window (m): <input id="ctrlInner" type="number" step="0.01"></div>
+  <div class="med">Outer window (m): <input id="ctrlOuter" type="number" step="0.01"></div>
+  <div class="med">Slow offset (us): <input id="ctrlSlow" type="number" step="10"></div>
+  <div class="med">Fast offset (us): <input id="ctrlFast" type="number" step="10"></div>
+  <button class="button startBtn" onclick="applyController()">APPLY CONTROLLER</button>
+  <div class="med" id="controllerStatus">Controller: --</div>
+  <div class="med" id="controllerCommands">Commands: --</div>
 </div>
 
 <div class="card">
@@ -1332,7 +1455,7 @@ function stopLog() {
   fetch('/stop')
     .then(() => fetch('/data'))
     .then(res => res.json())
-    .then(data => drawGraph(data.time, data.depth));
+    .then(data => drawGraph(data.time, data.depth, data.target, data.tolerance));
 }
 
 function updateElapsed() {
@@ -1366,7 +1489,8 @@ function updateStatus() {
       document.getElementById('team').innerText = 'Team: ' + data.team_id;
       document.getElementById('state').innerText = 'State: ' + data.state;
       document.getElementById('samples').innerText = 'Samples: ' + data.samples;
-      document.getElementById('actuator').innerText = 'Actuator: ' + data.actuator_us + ' us';
+      document.getElementById('actuator').innerText = 'Actuator: ' + data.actuator_us + ' us' +
+        (data.control_action ? ' / ' + data.control_action : '');
       document.getElementById('depth').innerText = 'Depth: ' + data.depth_m.toFixed(3) + ' m';
       document.getElementById('manualMode').innerText = data.manual_mode ? 'ON' : 'OFF';
     });
@@ -1447,7 +1571,7 @@ function applyMission() {
     });
 }
 
-function drawGraph(times, depths) {
+function drawGraph(times, depths, targets, tolerances) {
   const canvas = document.getElementById('graph');
   const ctx = canvas.getContext('2d');
 
@@ -1472,9 +1596,18 @@ function drawGraph(times, depths) {
 
   let dMin = depths[0];
   let dMax = depths[0];
-  for (let i = 1; i < depths.length; i++) {
+
+  for (let i = 0; i < depths.length; i++) {
     if (depths[i] < dMin) dMin = depths[i];
     if (depths[i] > dMax) dMax = depths[i];
+
+    if (targets && tolerances && i < targets.length && i < tolerances.length) {
+      const topWindow = targets[i] - tolerances[i];
+      const bottomWindow = targets[i] + tolerances[i];
+
+      if (topWindow < dMin) dMin = topWindow;
+      if (bottomWindow > dMax) dMax = bottomWindow;
+    }
   }
 
   if (dMax === dMin) {
@@ -1569,50 +1702,127 @@ function drawGraph(times, depths) {
   ctx.fillText('Depth (m)', 10, 15);
   ctx.fillText('Time (s)', right - 55, canvas.height - 10);
 
-  // ----- Plot -----
-  ctx.strokeStyle = '#0077cc';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
+  // ----- Target tolerance window -----
+  if (
+    targets &&
+    tolerances &&
+    targets.length === depths.length &&
+    tolerances.length === depths.length
+  ) {
+    ctx.fillStyle = 'rgba(46, 139, 87, 0.18)';
+    ctx.beginPath();
 
-  for (let i = 0; i < times.length; i++) {
-    const t = times[i] / 1000.0;
-    const d = depths[i];
+    // Upper edge of tolerance window
+    for (let i = 0; i < times.length; i++) {
+      const t = times[i] / 1000.0;
+      const d = targets[i] - tolerances[i];
 
-    const x = left + ((t - tMin) / (tMax - tMin)) * width;
+      const x = left + ((t - tMin) / (tMax - tMin)) * width;
+      const y = top + ((d - dMin) / (dMax - dMin)) * height;
 
-    // IMPORTANT:
-    // shallow depth near top, deeper depth near bottom
-    const y = top + ((d - dMin) / (dMax - dMin)) * height;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
 
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+    // Lower edge of tolerance window, drawn backwards
+    for (let i = times.length - 1; i >= 0; i--) {
+      const t = times[i] / 1000.0;
+      const d = targets[i] + tolerances[i];
+
+      const x = left + ((t - tMin) / (tMax - tMin)) * width;
+      const y = top + ((d - dMin) / (dMax - dMin)) * height;
+
+      ctx.lineTo(x, y);
+    }
+
+    ctx.closePath();
+    ctx.fill();
+
+    // Target centerline
+    ctx.strokeStyle = '#2e8b57';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 6]);
+    ctx.beginPath();
+
+    for (let i = 0; i < times.length; i++) {
+      const t = times[i] / 1000.0;
+      const d = targets[i];
+
+      const x = left + ((t - tMin) / (tMax - tMin)) * width;
+      const y = top + ((d - dMin) / (dMax - dMin)) * height;
+
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
 
-  ctx.stroke();
+    // ----- Plot -----
+    ctx.strokeStyle = '#0077cc';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    for (let i = 0; i < times.length; i++) {
+      const t = times[i] / 1000.0;
+      const d = depths[i];
+
+      const x = left + ((t - tMin) / (tMax - tMin)) * width;
+
+      // IMPORTANT:
+      // shallow depth near top, deeper depth near bottom
+      const y = top + ((d - dMin) / (dMax - dMin)) * height;
+
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+
+    ctx.stroke();
+
+  // Legend
+  ctx.font = '14px Helvetica';
+  ctx.fillStyle = '#0077cc';
+  ctx.fillText('Depth', left + 10, top + 20);
+
+  ctx.fillStyle = '#2e8b57';
+  ctx.fillText('Target', left + 90, top + 20);
+
+  ctx.fillStyle = 'rgba(46, 139, 87, 0.7)';
+  ctx.fillText('Tolerance window', left + 170, top + 20);
 }
 
-function loadPID() {
+function loadController() {
   fetch('/pid')
     .then(res => res.json())
     .then(data => {
-      document.getElementById('kp').value = data.kp;
-      document.getElementById('ki').value = data.ki;
-      document.getElementById('kd').value = data.kd;
-      document.getElementById('pidStatus').innerText =
-        `PID: Kp=${data.kp}, Ki=${data.ki}, Kd=${data.kd}`;
+      document.getElementById('ctrlInner').value = data.inner_m;
+      document.getElementById('ctrlOuter').value = data.outer_m;
+      document.getElementById('ctrlSlow').value = data.slow_us;
+      document.getElementById('ctrlFast').value = data.fast_us;
+
+      document.getElementById('controllerStatus').innerText =
+        `Controller: inner=${data.inner_m} m, outer=${data.outer_m} m, slow=${data.slow_us} us, fast=${data.fast_us} us`;
+
+      document.getElementById('controllerCommands').innerText =
+        `Commands: fast down=${data.deeper_fast_us} us, slow down=${data.deeper_slow_us} us, neutral=${data.neutral_us} us, slow up=${data.shallower_slow_us} us, fast up=${data.shallower_fast_us} us`;
     });
 }
 
-function applyPID() {
-  const kp = document.getElementById('kp').value;
-  const ki = document.getElementById('ki').value;
-  const kd = document.getElementById('kd').value;
+function applyController() {
+  const inner = document.getElementById('ctrlInner').value;
+  const outer = document.getElementById('ctrlOuter').value;
+  const slow = document.getElementById('ctrlSlow').value;
+  const fast = document.getElementById('ctrlFast').value;
 
-  fetch(`/setpid?kp=${encodeURIComponent(kp)}&ki=${encodeURIComponent(ki)}&kd=${encodeURIComponent(kd)}`)
+  fetch(`/setpid?inner=${encodeURIComponent(inner)}&outer=${encodeURIComponent(outer)}&slow=${encodeURIComponent(slow)}&fast=${encodeURIComponent(fast)}`)
     .then(res => res.json())
     .then(data => {
-      document.getElementById('pidStatus').innerText =
-        `PID: Kp=${data.kp}, Ki=${data.ki}, Kd=${data.kd}`;
+      document.getElementById('controllerStatus').innerText =
+        `Controller: inner=${data.inner_m} m, outer=${data.outer_m} m, slow=${data.slow_us} us, fast=${data.fast_us} us`;
+
+      document.getElementById('controllerCommands').innerText =
+        `Commands: fast down=${data.deeper_fast_us} us, slow down=${data.deeper_slow_us} us, neutral=${data.neutral_us} us, slow up=${data.shallower_slow_us} us, fast up=${data.shallower_fast_us} us`;
     });
 }
 
@@ -1626,7 +1836,7 @@ updateElapsed();
 updateRTC();
 updatePressure();
 updateStatus();
-loadPID();
+loadController();
 loadManual();
 loadMission();
 </script>
